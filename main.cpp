@@ -3,18 +3,31 @@
 #include <map>
 #include <portaudio.h>
 #include <math.h>
+#include <cstdlib>
+#include <string.h>
 
 struct Sample {
+    Sample() {
+        finetune = 0;
+    }
+
     std::string name;
-    uint64_t length;
+    uint64_t length = 0;
     uint8_t finetune : 4;
-    uint8_t volume;
-    uint64_t loopstart;
-    uint64_t looplength;
-    uint8_t *data;
+    uint8_t volume = 0;
+    uint64_t loopstart = 0;
+    uint64_t looplength = 0;
+    int8_t *data;
 };
 
 struct Note {
+    Note() {
+        period = 0;
+        sample = 0;
+        effect = 0;
+        argument = 0;
+    }
+
     uint16_t period : 12;
     uint8_t sample;
     uint8_t effect : 4;
@@ -75,19 +88,22 @@ struct ChannelState {
         liveeffect = 0;
     }
 
-    double samplepoint;
+    double samplepoint = 0.0;
     unsigned short latchedperiod : 12;
     unsigned char  latchedsample = 0;
     unsigned char  latchedvolume = 0;
     unsigned char  lasteffectparam = 0;
     unsigned char  lasteffect : 4;
+    unsigned char  livesample = 0;
     unsigned short liveperiod : 12;
     unsigned char  livevolume = 0;
     unsigned char  liveeffect : 4;
     unsigned char  liveeffectparam = 0;
     unsigned int   offset = 0;
-    bool inloop = false;
+    bool ploop = 0;
+    unsigned int   loopstartrow = 0;
     unsigned int   loopcnt = 0;
+    unsigned int   portamemory = 0;
 };
 
 struct TrackerState {
@@ -101,20 +117,30 @@ struct TrackerState {
 };
 
 enum ReturnAction {
+    TICK,
     INC,
-    LOOP,
     JUMP
 };
 
+struct JumpLocation {
+    uint64_t order;
+    uint64_t row;
+};
+
 struct TickReturn {
-    uint8_t *audio;
+    int8_t *audio[2];
     uint64_t nsamples;
     ReturnAction action;
+    JumpLocation location;
 };
 
 enum PlayReturn {
     PLAY_OK,
     PLAY_FAILED
+};
+
+struct TickState {
+    std::map<int, bool> effectseen;
 };
 
 class PeriodCorrector {
@@ -125,8 +151,8 @@ public:
 
     unsigned short CorrectPeriod(unsigned short period, unsigned char finetune) {
         for(int i = 0; i < 36; i++) {
-            if(periods[i][0] == period)
-                return periods[i][finetune];
+            if(periods[0][i] == period)
+                return periods[finetune][i];
         }
         return 0;
     }
@@ -172,12 +198,15 @@ private:
         periods[9][ 6]--;  periods[9][26]--;  periods[12][34]--;
     }
 
-    unsigned short periods[36][36];
+    unsigned short periods[16][36];
 };
 
 class ModulePlayer {
 public:
     ModulePlayer(std::fstream &moduledata, Verbosity verbosity = MESSAGE) : verbosity(verbosity) {
+        Pa_Initialize();
+        Pa_OpenDefaultStream(&stream, 0, 2, paInt8, 44100.0, paFramesPerBufferUnspecified, NULL, NULL);
+        Pa_StartStream(stream);
         if(!LoadModuleHeader(moduledata)) {
             loadstate = LOAD_FAILED_HEADER;
             return;
@@ -204,6 +233,7 @@ public:
                 case LOAD_OK:
                     std::cout << "Module load was successful, starting playback!"
                               << std::endl;
+                break;
                 case LOAD_FAILED_HEADER:
                     std::cout << "Module Load failed at header, is this a MOD file?"
                               << std::endl;
@@ -222,13 +252,221 @@ public:
                     return PLAY_FAILED;
             }
         }
-        for(int i = 0;)
+        uint64_t row = 0;
+        uint64_t tick = 0;
+        for(uint64_t i = 0; i < mod.norders; i++) {
+            while(true) {
+                TickReturn ret = PlayOneTick(i, row, tick);
+                int8_t *audio = new int8_t[ret.nsamples*2];
+                for(uint64_t s = 0; s < ret.nsamples; s++) {
+                    audio[s*2] = ret.audio[0][s];
+                    audio[(s*2) + 1] = ret.audio[1][s];
+                }
+                delete[] ret.audio[0];
+                delete[] ret.audio[1];
+                Pa_WriteStream(stream, audio, ret.nsamples);
+                delete[] audio;
+                switch(ret.action) {
+                    case TICK:
+                        tick++;
+                    break;
+                    case INC:
+                        tick = 0;
+                        if(row == 63) {
+                            row = 0;
+                            goto nextorder;
+                        }
+                        row++;
+                    break;
+                    case JUMP:
+                        i = ret.location.order - 1;
+                        row = ret.location.row;
+                        goto nextorder;
+                }
+            }
+            nextorder:
+            continue;
+        }
         return PLAY_OK;
     }
 
     TickReturn PlayOneTick(uint64_t order, uint64_t row, uint8_t tick) {
         TickReturn ret;
-        ret.action = INC;
+        ret.action = TICK;
+        if(tick == (state.tpr - 1)) {
+            ret.action = INC;
+        }
+        ret.audio[0] = new int8_t[state.SamplesPerTick()];
+        ret.audio[1] = new int8_t[state.SamplesPerTick()];
+        ret.nsamples = state.SamplesPerTick();
+        TickState ts;
+        for(uint64_t i = 0; i < mod.patterns[mod.orders[order]].rows[0].nchannels; i++) {
+            Note n = mod.patterns[mod.orders[order]].rows[row].notes[i];
+            if(tick == (state.tpr - 1)) {
+                //Effects performed on last tick
+                switch(n.effect) {
+                    case 0xD:
+                        if(ts.effectseen[0xE6])
+                            break;
+                        ts.effectseen[0xD] = true;
+                        ret.action = JUMP;
+                        if(!ts.effectseen[0xB])
+                            ret.location.order = order + 1;
+                        ret.location.row = (10 * (n.argument & 0xF0 >> 4)) + n.argument & 0x0F;
+                        if(ret.location.row > 63)
+                            ret.location.row = 63;
+                    break;
+                    case 0xB:
+                        if(ts.effectseen[0xE6])
+                            break;
+                        ts.effectseen[0xB] = true;
+                        ret.action = JUMP;
+                        ret.location.order = n.argument;
+                        if(ret.location.order >  mod.norders)
+                            ret.location.order = 0;
+                        if(!ts.effectseen[0xD])
+                            ret.location.row = 0;
+                    break;
+                    case 0xE:
+                        switch(n.argument >> 4) {
+                            case 0x6:
+                                if(!(n.argument & 0x0F))
+                                    state.cstate[i].loopstartrow = row;
+                                else {
+                                    if(!state.cstate[i].loopcnt)
+                                        state.cstate[i].loopcnt = (n.argument & 0x0F) + 1;
+                                    if((state.cstate[i].loopcnt - 1)) {
+                                        state.cstate[i].loopcnt--;
+                                        ts.effectseen[0xE6] = true;
+                                        ret.action = JUMP;
+                                        ret.location.order = order - 1;
+                                        ret.location.row = state.cstate[i].loopstartrow;
+                                    }
+                                }
+                            break;
+
+                        }
+                    break;
+                }
+            }
+            if(!tick) {
+                if(n.sample != 0) {
+                    state.cstate[i].latchedsample = n.sample;
+                    state.cstate[i].latchedvolume = mod.samples[n.sample - 1].volume;
+                    state.cstate[i].livevolume = mod.samples[n.sample - 1].volume;
+                }
+                if(n.period != 0) {
+                    if(!state.cstate[i].livesample) {
+                        if(state.cstate[i].latchedsample)
+                            state.cstate[i].livesample = state.cstate[i].latchedsample;
+                        else
+                            goto nosample;
+                    }
+                    state.cstate[i].latchedperiod = corrector.CorrectPeriod(n.period, mod.samples[state.cstate[i].livesample - 1].finetune);
+                    if(n.effect != 0x3 || (n.effect == 0x3 && !state.cstate[i].liveperiod)) {
+                        state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
+                    }
+                }
+                nosample:
+                //Effects that are performed once a row, on the zero tick.
+                switch(n.effect) {
+                    case 0xC:
+                        state.cstate[i].livevolume = n.argument;
+                        state.cstate[i].latchedvolume = n.argument;
+                    break;
+                    case 0xF:
+                        if(!n.argument)
+                            break;
+                        if(n.argument < 32)
+                            state.tpr = n.argument;
+                        else
+                            state.bpm = n.argument;
+                    break;
+                    case 0xE:
+                        switch((n.argument & 0xF0 >> 4)) {
+                            case 1:
+                                state.cstate[i].liveperiod -= n.argument & 0x0F;
+                                if(state.cstate[i].liveperiod < 113)
+                                    state.cstate[i].liveperiod = 113;
+                            break;
+                            case 2:
+                                state.cstate[i].liveperiod += n.argument & 0x0F;
+                                if(state.cstate[i].liveperiod > 856)
+                                    state.cstate[i].liveperiod = 856;
+                            break;
+                        }
+                    break;
+                }
+            } else {
+                switch(n.effect) {
+                    case 1:
+                        state.cstate[i].liveperiod -= n.argument;
+                        if(state.cstate[i].liveperiod < 113)
+                            state.cstate[i].liveperiod = 113;
+                    break;
+                    case 2:
+                        state.cstate[i].liveperiod += n.argument;
+                        if(state.cstate[i].liveperiod > 856)
+                            state.cstate[i].liveperiod = 856;
+                    break;
+                    case 3:
+                        if(n.argument == 0)
+                            n.argument = state.cstate[i].portamemory;
+                        else
+                            state.cstate[i].portamemory = n.argument;
+                        if(state.cstate[i].latchedperiod == state.cstate[i].liveperiod)
+                            break;
+                        float direction = copysign(1, state.cstate[i].latchedperiod - state.cstate[i].liveperiod);
+                        state.cstate[i].liveperiod = state.cstate[i].liveperiod + (direction * n.argument);
+                        float direction2 = copysign(1, state.cstate[i].latchedperiod - state.cstate[i].liveperiod);
+                        if((int)direction != (int)direction2)
+                            state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
+                    break;
+
+                }
+            }
+            for(uint64_t sample = 0; sample < state.SamplesPerTick(); sample++) {
+                if(state.cstate[i].livesample && (state.cstate[i].livesample <= mod.nsamples)) {
+                    if(state.cstate[i].samplepoint > mod.samples[state.cstate[i].livesample - 1].length
+                            && (mod.samples[state.cstate[i].livesample - 1].looplength < 4)) {
+                        state.cstate[i].liveperiod = 0;
+                        state.cstate[i].samplepoint = 0;
+                        state.cstate[i].livesample = 0;
+                        if(i % 2 == 0) {
+                            memset(ret.audio[0] + sample, 0, state.SamplesPerTick() - sample);
+                        } else {
+                            memset(ret.audio[1] + sample, 0, state.SamplesPerTick() - sample);
+                        }
+                        break;
+                    }
+                    if((state.cstate[i].samplepoint > (mod.samples[state.cstate[i].livesample - 1].loopstart + mod.samples[state.cstate[i].livesample - 1].looplength))
+                            && (mod.samples[state.cstate[i].livesample].looplength > 3)) {
+                        state.cstate[i].samplepoint = mod.samples[state.cstate[i].livesample - 1].loopstart;
+                    }
+                    if(state.cstate[i].liveperiod) {
+                        if(i % 2 == 0) {
+                            Sample s = mod.samples[state.cstate[i].livesample - 1];
+                            double a = s.data[(uint64_t)state.cstate[i].samplepoint];
+                            //ret.audio[0][sample] += a/(mod.patterns[mod.orders[order]].rows[0].nchannels/2);
+                        } else {
+                            Sample s = mod.samples[state.cstate[i].livesample - 1];
+                            double a = s.data[(uint64_t)state.cstate[i].samplepoint];
+                            ret.audio[1][sample] = a;
+                            //ret.audio[1][sample] += a/(mod.patterns[mod.orders[order]].rows[0].nchannels/2);
+                        }
+                        //state.cstate[i].samplepoint += 44100.0/(3546895.0 / state.cstate[i].liveperiod);
+                        //state.cstate[i].samplepoint += (14317056.0/state.cstate[i].liveperiod) / 44100*4;
+                        state.cstate[i].samplepoint += 1;
+                    } else {
+                        if(i % 2 == 0) {
+                            ret.audio[0][sample] += 0;
+                        } else {
+                            ret.audio[1][sample] += 0;
+                        }
+                    }
+                }
+            }
+        }
         return ret;
     }
 
@@ -237,10 +475,10 @@ private:
         for(uint64_t i = 0; i < mod.nsamples; i++) {
             if(!mod.samples[i].length)
                 continue;
-            mod.samples[i].data = new uint8_t[mod.samples[i].length];
+            mod.samples[i].data = new int8_t[mod.samples[i].length];
             moduledata.read((char*)mod.samples[i].data, mod.samples[i].length);
             if(!moduledata.good()) {
-                return 0;
+               return 0;
             }
         }
         return 1;
@@ -311,9 +549,12 @@ private:
         mod.orders = new uint8_t[mod.norders];
         moduledata.get();
         //Restart point, unsure of what to do with it.
+        mod.npatterns = 0;
         for(uint64_t i = 0; i < 128; i++){
             if(i < mod.norders) {
                 mod.orders[i] = moduledata.get();
+                mod.npatterns = mod.npatterns > (mod.orders[i] + 1) ? (mod.npatterns) : (mod.orders[i] + 1);
+
             } else {
                 uint8_t item = moduledata.get();
                 mod.npatterns = mod.npatterns > (item + 1) ? (mod.npatterns) : (item + 1);
@@ -348,20 +589,20 @@ private:
         for(uint8_t i = 0; i < mod.npatterns; i++) {
            mod.patterns[i].nrows = 64;
            mod.patterns[i].rows = new Row[64];
-           for(uint64_t row = 0; i < mod.patterns[i].nrows; row++){
+           for(uint64_t row = 0; row < mod.patterns[i].nrows; row++){
                mod.patterns[i].rows[row].nchannels = nchannels;
                mod.patterns[i].rows[row].notes = new Note[nchannels];
                for(uint64_t channel = 0; channel < nchannels; channel++) {
-                   uint32_t note = 0;
-                   note |= (unsigned long)moduledata.get() << 24;
-                   note |= (unsigned long)moduledata.get() << 16;
-                   note |= (unsigned long)moduledata.get() << 8;
-                   note |= (unsigned long)moduledata.get();
+                   uint8_t note[4];
+                   note[0] = (unsigned long)moduledata.get();
+                   note[1] = (unsigned long)moduledata.get();
+                   note[2] = (unsigned long)moduledata.get();
+                   note[3] = (unsigned long)moduledata.get();
                    Note stnote;
-                   stnote.period = (note & 0x0F000000 >> 12) | (note & 0x00FF0000) >> 16;
-                   stnote.effect = (note & 0x00000F00 >> 8);
-                   stnote.argument = note & 0x000000FF;
-                   stnote.sample = ((note & 0xF0000000) >> 24) & (note & 0x0000F000) >> 12;
+                   stnote.period = ((note[0] & 0x0F) << 8) | (note[1]);
+                   stnote.effect = note[2] & 0x0F;
+                   stnote.argument = note[3];
+                   stnote.sample = (note[0] & 0xF0) | (note[2] & 0xF0) >> 4;
                    mod.patterns[i].rows[row].notes[channel] = stnote;
                }
            }
@@ -372,6 +613,7 @@ private:
         return 1;
     }
 
+    PaStream *stream;
     PeriodCorrector corrector;
     Verbosity verbosity = NONE;
     TrackerState state;
@@ -384,6 +626,7 @@ int main(int argc, char *argv[])
     if(argc > 1) {
         std::fstream f(argv[1], std::ios_base::in | std::ios_base::binary);
         ModulePlayer player(f);
+        player.playModule();
     }
     return 0;
 }
