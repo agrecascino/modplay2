@@ -6,3 +6,4 @@ CONFIG -= qt
 SOURCES += main.cpp
 
 LIBS += -lportaudio
+QMAKE_CXXFLAGS += -std=c++14 -g

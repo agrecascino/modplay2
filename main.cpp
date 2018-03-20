@@ -5,6 +5,8 @@
 #include <math.h>
 #include <cstdlib>
 #include <string.h>
+#include <stdint.h>
+#include <assert.h>
 
 struct Sample {
     Sample() {
@@ -104,6 +106,7 @@ struct ChannelState {
     unsigned int   loopstartrow = 0;
     unsigned int   loopcnt = 0;
     unsigned int   portamemory = 0;
+    unsigned int   offsetmemory = 0;
 };
 
 struct TrackerState {
@@ -128,7 +131,7 @@ struct JumpLocation {
 };
 
 struct TickReturn {
-    int8_t *audio[2];
+    int16_t *audio[2];
     uint64_t nsamples;
     ReturnAction action;
     JumpLocation location;
@@ -205,7 +208,7 @@ class ModulePlayer {
 public:
     ModulePlayer(std::fstream &moduledata, Verbosity verbosity = MESSAGE) : verbosity(verbosity) {
         Pa_Initialize();
-        Pa_OpenDefaultStream(&stream, 0, 2, paInt8, 44100.0, paFramesPerBufferUnspecified, NULL, NULL);
+        Pa_OpenDefaultStream(&stream, 0, 2, paInt16, 44100.0, paFramesPerBufferUnspecified, NULL, NULL);
         Pa_StartStream(stream);
         if(!LoadModuleHeader(moduledata)) {
             loadstate = LOAD_FAILED_HEADER;
@@ -230,61 +233,66 @@ public:
     PlayReturn playModule() {
         if(verbosity > NONE) {
             switch(loadstate) {
-                case LOAD_OK:
-                    std::cout << "Module load was successful, starting playback!"
-                              << std::endl;
+            case LOAD_OK:
+                std::cout << "Module load was successful, starting playback!"
+                          << std::endl;
                 break;
-                case LOAD_FAILED_HEADER:
-                    std::cout << "Module Load failed at header, is this a MOD file?"
-                              << std::endl;
-                    return PLAY_FAILED;
-                case LOAD_FAILED_PATTERN:
-                    std::cout << "Module load failed at pattern loading, module may be corrupted."
-                              << std::endl;
-                    return PLAY_FAILED;
-                case LOAD_FAILED_SAMPLE:
-                    std::cout << "Module load failed at sample loading, module may be corrupted."
-                              << std::endl;
-                    return PLAY_FAILED;
-                case LOAD_FAILED_OTHER:
-                    std::cout << "Module load failed in an unknown way. Oh no."
-                              << std::endl;
-                    return PLAY_FAILED;
+            case LOAD_FAILED_HEADER:
+                std::cout << "Module Load failed at header, is this a MOD file?"
+                          << std::endl;
+                return PLAY_FAILED;
+            case LOAD_FAILED_PATTERN:
+                std::cout << "Module load failed at pattern loading, module may be corrupted."
+                          << std::endl;
+                return PLAY_FAILED;
+            case LOAD_FAILED_SAMPLE:
+                std::cout << "Module load failed at sample loading, module may be corrupted."
+                          << std::endl;
+                return PLAY_FAILED;
+            case LOAD_FAILED_OTHER:
+                std::cout << "Module load failed in an unknown way. Oh no."
+                          << std::endl;
+                return PLAY_FAILED;
             }
         }
         uint64_t row = 0;
         uint64_t tick = 0;
-        for(uint64_t i = 0; i < mod.norders; i++) {
+        for(uint64_t i = 0; i < mod.norders;) {
             while(true) {
                 TickReturn ret = PlayOneTick(i, row, tick);
-                int8_t *audio = new int8_t[ret.nsamples*2];
+                int16_t *audio = new int16_t[ret.nsamples*2];
                 for(uint64_t s = 0; s < ret.nsamples; s++) {
-                    audio[s*2] = ret.audio[0][s];
-                    audio[(s*2) + 1] = ret.audio[1][s];
+                    audio[s*2] = ret.audio[0][s]*0.66 + ret.audio[1][s]*0.33;
+                    audio[(s*2) + 1] = ret.audio[1][s]*0.66  + ret.audio[0][s]*0.33;
                 }
                 delete[] ret.audio[0];
                 delete[] ret.audio[1];
                 Pa_WriteStream(stream, audio, ret.nsamples);
                 delete[] audio;
                 switch(ret.action) {
-                    case TICK:
-                        tick++;
+                case TICK:
+                    tick++;
                     break;
-                    case INC:
-                        tick = 0;
-                        if(row == 63) {
-                            row = 0;
-                            goto nextorder;
-                        }
-                        row++;
-                    break;
-                    case JUMP:
-                        i = ret.location.order - 1;
-                        row = ret.location.row;
+                case INC:
+                    std::cout << "Row: " << row << std::endl;
+                    tick = 0;
+                    if(row == 63) {
+                        row = 0;
+                        i++;
                         goto nextorder;
+                    }
+                    row++;
+                    break;
+                case JUMP:
+                    std::cout << "Jumping to row=" << ret.location.row
+                              << "order=" << ret.location.order << std::endl;
+                    tick = 0;
+                    i = ret.location.order;
+                    row = ret.location.row;
+                    goto nextorder;
                 }
             }
-            nextorder:
+nextorder:
             continue;
         }
         return PLAY_OK;
@@ -296,177 +304,252 @@ public:
         if(tick == (state.tpr - 1)) {
             ret.action = INC;
         }
-        ret.audio[0] = new int8_t[state.SamplesPerTick()];
-        ret.audio[1] = new int8_t[state.SamplesPerTick()];
+        ret.audio[0] = new int16_t[state.SamplesPerTick()];
+        memset(ret.audio[0], 0, state.SamplesPerTick()*2);
+        ret.audio[1] = new int16_t[state.SamplesPerTick()];
+        memset(ret.audio[1], 0, state.SamplesPerTick()*2);
         ret.nsamples = state.SamplesPerTick();
         TickState ts;
         for(uint64_t i = 0; i < mod.patterns[mod.orders[order]].rows[0].nchannels; i++) {
             Note n = mod.patterns[mod.orders[order]].rows[row].notes[i];
+            if(!row) {
+                std::cout << "Pattern " << (int)mod.orders[order] << std::endl;
+            }
             if(tick == (state.tpr - 1)) {
                 //Effects performed on last tick
                 switch(n.effect) {
-                    case 0xD:
-                        if(ts.effectseen[0xE6])
-                            break;
-                        ts.effectseen[0xD] = true;
-                        ret.action = JUMP;
-                        if(!ts.effectseen[0xB])
-                            ret.location.order = order + 1;
-                        ret.location.row = (10 * (n.argument & 0xF0 >> 4)) + n.argument & 0x0F;
-                        if(ret.location.row > 63)
-                            ret.location.row = 63;
+                case 0xD:
+                    if(ts.effectseen[0xE6])
+                        break;
+                    ts.effectseen[0xD] = true;
+                    ret.action = JUMP;
+                    if(!ts.effectseen[0xB])
+                        ret.location.order = order + 1;
+                    ret.location.row = ((n.argument & 0XF0) >> 4)* 10 + (n.argument & 0x0F);
+                    if(ret.location.row > 63)
+                        ret.location.row = 63;
                     break;
-                    case 0xB:
-                        if(ts.effectseen[0xE6])
-                            break;
-                        ts.effectseen[0xB] = true;
-                        ret.action = JUMP;
-                        ret.location.order = n.argument;
-                        if(ret.location.order >  mod.norders)
-                            ret.location.order = 0;
-                        if(!ts.effectseen[0xD])
-                            ret.location.row = 0;
+                case 0xB:
+                    if(ts.effectseen[0xE6])
+                        break;
+                    ts.effectseen[0xB] = true;
+                    ret.action = JUMP;
+                    ret.location.order = n.argument;
+                    if(ret.location.order >  mod.norders)
+                        ret.location.order = 0;
+                    if(!ts.effectseen[0xD])
+                        ret.location.row = 0;
                     break;
-                    case 0xE:
-                        switch(n.argument >> 4) {
-                            case 0x6:
-                                if(!(n.argument & 0x0F))
-                                    state.cstate[i].loopstartrow = row;
-                                else {
-                                    if(!state.cstate[i].loopcnt)
-                                        state.cstate[i].loopcnt = (n.argument & 0x0F) + 1;
-                                    if((state.cstate[i].loopcnt - 1)) {
-                                        state.cstate[i].loopcnt--;
-                                        ts.effectseen[0xE6] = true;
-                                        ret.action = JUMP;
-                                        ret.location.order = order - 1;
-                                        ret.location.row = state.cstate[i].loopstartrow;
-                                    }
-                                }
-                            break;
-
+                case 0xE:
+                    switch(n.argument >> 4) {
+                    case 0x6:
+                        if(!(n.argument & 0x0F))
+                            state.cstate[i].loopstartrow = row;
+                        else {
+                            if(!state.cstate[i].loopcnt)
+                                state.cstate[i].loopcnt = (n.argument & 0x0F) + 1;
+                            if((state.cstate[i].loopcnt - 1)) {
+                                state.cstate[i].loopcnt--;
+                                ts.effectseen[0xE6] = true;
+                                ret.action = JUMP;
+                                ret.location.order = order - 1;
+                                ret.location.row = state.cstate[i].loopstartrow;
+                            }
                         }
+                        break;
+                    case 0xE:
+
+                    }
                     break;
                 }
             }
             if(!tick) {
+                std::cout << n.period;
+                std::cout << " ";
+                std::cout << (int)n.sample;
+                std::cout << " ";
                 if(n.sample != 0) {
                     state.cstate[i].latchedsample = n.sample;
                     state.cstate[i].latchedvolume = mod.samples[n.sample - 1].volume;
                     state.cstate[i].livevolume = mod.samples[n.sample - 1].volume;
                 }
+                bool unhit = false;
+
                 if(n.period != 0) {
                     if(!state.cstate[i].livesample) {
                         if(state.cstate[i].latchedsample)
                             state.cstate[i].livesample = state.cstate[i].latchedsample;
                         else
                             goto nosample;
-                    }
+                    } else if(n.sample)
+                        state.cstate[i].livesample = n.sample;
                     state.cstate[i].latchedperiod = corrector.CorrectPeriod(n.period, mod.samples[state.cstate[i].livesample - 1].finetune);
-                    if(n.effect != 0x3 || (n.effect == 0x3 && !state.cstate[i].liveperiod)) {
+                    if(((n.effect != 0x3) && (n.effect != 0x5)) || (((n.effect == 0x3) || (n.effect == 0x5)) && !state.cstate[i].liveperiod)) {
+                        state.cstate[i].samplepoint = 0;
                         state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
                     }
                 }
-                nosample:
+                if(unhit) {
+                    std::cout << (int)state.cstate[i].livesample << std::endl;
+                    std::cout << state.cstate[i].samplepoint << std::endl;
+                    std::cout << state.cstate[i].liveperiod << std::endl;
+                }
+nosample:
                 //Effects that are performed once a row, on the zero tick.
                 switch(n.effect) {
-                    case 0xC:
-                        state.cstate[i].livevolume = n.argument;
-                        state.cstate[i].latchedvolume = n.argument;
+                case 0xC:
+                    state.cstate[i].livevolume = n.argument;
+                    state.cstate[i].latchedvolume = n.argument;
                     break;
-                    case 0xF:
-                        if(!n.argument)
-                            break;
-                        if(n.argument < 32)
-                            state.tpr = n.argument;
-                        else
-                            state.bpm = n.argument;
+                case 0xF:
+                    if(!n.argument)
+                        break;
+                    if(n.argument <= 32)
+                        state.tpr = n.argument;
+                    else {
+                        state.bpm = n.argument;
+                        delete[] ret.audio[0];
+                        delete[] ret.audio[1];
+                        ret.audio[0] = new int16_t[state.SamplesPerTick()];
+                        memset(ret.audio[0], 0, state.SamplesPerTick()*2);
+                        ret.audio[1] = new int16_t[state.SamplesPerTick()];
+                        memset(ret.audio[1], 0, state.SamplesPerTick()*2);
+                        ret.nsamples = state.SamplesPerTick();
+                    }
                     break;
-                    case 0xE:
-                        switch((n.argument & 0xF0 >> 4)) {
-                            case 1:
-                                state.cstate[i].liveperiod -= n.argument & 0x0F;
-                                if(state.cstate[i].liveperiod < 113)
-                                    state.cstate[i].liveperiod = 113;
-                            break;
-                            case 2:
-                                state.cstate[i].liveperiod += n.argument & 0x0F;
-                                if(state.cstate[i].liveperiod > 856)
-                                    state.cstate[i].liveperiod = 856;
-                            break;
-                        }
+                case 0xE:
+                    switch(((n.argument & 0xF0) >> 4)) {
+                    case 1:
+                        state.cstate[i].liveperiod -= n.argument & 0x0F;
+                        if(state.cstate[i].liveperiod < 113)
+                            state.cstate[i].liveperiod = 113;
+                        break;
+                    case 2:
+                        state.cstate[i].liveperiod += n.argument & 0x0F;
+                        if(state.cstate[i].liveperiod > 856)
+                            state.cstate[i].liveperiod = 856;
+                        break;
+                    case 0xA: {
+                        int cv = state.cstate[i].livevolume;
+                        cv += n.argument & 0x0F;
+                        cv = fmaxf(fminf(cv, 64), 0);
+                        state.cstate[i].livevolume = cv;
+                        break; }
+                    case 0xB: {
+                        int cv = state.cstate[i].livevolume;
+                        cv -= n.argument & 0x0F;
+                        cv = fmaxf(fminf(cv, 64), 0);
+                        state.cstate[i].livevolume = cv;
+                        break; }
+                    }
+                    break;
+                case 0x9:
+                    if(!n.argument) {
+                        state.cstate[i].samplepoint = state.cstate[i].offsetmemory;
+                        break;
+                    }
+                    state.cstate[i].offsetmemory = n.argument * 256;
+                    state.cstate[i].samplepoint = n.argument * 256;
                     break;
                 }
             } else {
                 switch(n.effect) {
-                    case 1:
-                        state.cstate[i].liveperiod -= n.argument;
-                        if(state.cstate[i].liveperiod < 113)
-                            state.cstate[i].liveperiod = 113;
+                case 1:
+                    state.cstate[i].liveperiod -= n.argument;
+                    if(state.cstate[i].liveperiod < 113)
+                        state.cstate[i].liveperiod = 113;
                     break;
-                    case 2:
-                        state.cstate[i].liveperiod += n.argument;
-                        if(state.cstate[i].liveperiod > 856)
-                            state.cstate[i].liveperiod = 856;
+                case 2:
+                    state.cstate[i].liveperiod += n.argument;
+                    if(state.cstate[i].liveperiod > 856)
+                        state.cstate[i].liveperiod = 856;
                     break;
-                    case 3:
-                        if(n.argument == 0)
-                            n.argument = state.cstate[i].portamemory;
-                        else
-                            state.cstate[i].portamemory = n.argument;
-                        if(state.cstate[i].latchedperiod == state.cstate[i].liveperiod)
-                            break;
-                        float direction = copysign(1, state.cstate[i].latchedperiod - state.cstate[i].liveperiod);
-                        state.cstate[i].liveperiod = state.cstate[i].liveperiod + (direction * n.argument);
-                        float direction2 = copysign(1, state.cstate[i].latchedperiod - state.cstate[i].liveperiod);
-                        if((int)direction != (int)direction2)
-                            state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
+                case 3: {
+                    if(!n.argument)
+                        n.argument = state.cstate[i].portamemory;
+                    else
+                        state.cstate[i].portamemory = n.argument;
+                    if(state.cstate[i].latchedperiod == state.cstate[i].liveperiod)
+                        break;
+                    int initial = (int)state.cstate[i].latchedperiod - (int)state.cstate[i].liveperiod;
+                    float direction = copysign(1, initial);
+                    int final = (int)state.cstate[i].latchedperiod - (int)((int)state.cstate[i].liveperiod + (direction * n.argument));
+                    state.cstate[i].liveperiod = state.cstate[i].liveperiod + (direction * n.argument);
+                    float direction2 = copysign(1, final);
+                    if((int)direction != (int)direction2)
+                        state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
+                    break; }
+                case 5: {
+                    unsigned char x = (n.argument & 0xF0) >> 4;
+                    unsigned char y = (n.argument & 0x0F);
+                    if(x && y)
+                        break;
+                    int cv = state.cstate[i].livevolume;
+                    if(x)
+                        cv += x;
+                    if(y)
+                        cv -= y;
+                    cv = fmaxf(fminf(cv, 64), 0);
+                    state.cstate[i].livevolume = cv;
+                    if(state.cstate[i].latchedperiod == state.cstate[i].liveperiod)
+                        break;
+                    int initial = (int)state.cstate[i].latchedperiod - (int)state.cstate[i].liveperiod;
+                    float direction = copysign(1, initial);
+                    int final = (int)state.cstate[i].latchedperiod - (int)((int)state.cstate[i].liveperiod + (direction * n.argument));
+                    state.cstate[i].liveperiod = state.cstate[i].liveperiod + (direction * n.argument);
+                    float direction2 = copysign(1, final);
+                    if((int)direction != (int)direction2)
+                        state.cstate[i].liveperiod = state.cstate[i].latchedperiod;
+                    break; }
+                case 0xA:
+                    if(!n.argument)
+                        break;
+                    unsigned char x = (n.argument & 0xF0) >> 4;
+                    unsigned char y = (n.argument & 0x0F);
+                    if(x && y)
+                        break;
+                    int cv = state.cstate[i].livevolume;
+                    if(x)
+                        cv += x;
+                    if(y)
+                        cv -= y;
+                    cv = fmaxf(fminf(cv, 64), 0);
+                    state.cstate[i].livevolume = cv;
                     break;
-
                 }
             }
+
             for(uint64_t sample = 0; sample < state.SamplesPerTick(); sample++) {
                 if(state.cstate[i].livesample && (state.cstate[i].livesample <= mod.nsamples)) {
-                    if(state.cstate[i].samplepoint > mod.samples[state.cstate[i].livesample - 1].length
-                            && (mod.samples[state.cstate[i].livesample - 1].looplength < 4)) {
+                    if((state.cstate[i].samplepoint > (mod.samples[state.cstate[i].livesample - 1].loopstart + mod.samples[state.cstate[i].livesample - 1].looplength))
+                            && (mod.samples[state.cstate[i].livesample - 1].looplength > 3)) {
+                        state.cstate[i].samplepoint = mod.samples[state.cstate[i].livesample - 1].loopstart;
+                    }
+                    if((uint64_t)state.cstate[i].samplepoint >= (mod.samples[state.cstate[i].livesample - 1].length)) {
                         state.cstate[i].liveperiod = 0;
                         state.cstate[i].samplepoint = 0;
                         state.cstate[i].livesample = 0;
-                        if(i % 2 == 0) {
-                            memset(ret.audio[0] + sample, 0, state.SamplesPerTick() - sample);
-                        } else {
-                            memset(ret.audio[1] + sample, 0, state.SamplesPerTick() - sample);
-                        }
-                        break;
-                    }
-                    if((state.cstate[i].samplepoint > (mod.samples[state.cstate[i].livesample - 1].loopstart + mod.samples[state.cstate[i].livesample - 1].looplength))
-                            && (mod.samples[state.cstate[i].livesample].looplength > 3)) {
-                        state.cstate[i].samplepoint = mod.samples[state.cstate[i].livesample - 1].loopstart;
                     }
                     if(state.cstate[i].liveperiod) {
-                        if(i % 2 == 0) {
+                        /*if(i == 2) {44100.0
                             Sample s = mod.samples[state.cstate[i].livesample - 1];
                             double a = s.data[(uint64_t)state.cstate[i].samplepoint];
-                            //ret.audio[0][sample] += a/(mod.patterns[mod.orders[order]].rows[0].nchannels/2);
-                        } else {
-                            Sample s = mod.samples[state.cstate[i].livesample - 1];
-                            double a = s.data[(uint64_t)state.cstate[i].samplepoint];
-                            ret.audio[1][sample] = a;
-                            //ret.audio[1][sample] += a/(mod.patterns[mod.orders[order]].rows[0].nchannels/2);
-                        }
-                        //state.cstate[i].samplepoint += 44100.0/(3546895.0 / state.cstate[i].liveperiod);
-                        //state.cstate[i].samplepoint += (14317056.0/state.cstate[i].liveperiod) / 44100*4;
-                        state.cstate[i].samplepoint += 1;
-                    } else {
-                        if(i % 2 == 0) {
-                            ret.audio[0][sample] += 0;
-                        } else {
-                            ret.audio[1][sample] += 0;
-                        }
+                            ret.audio[0][sample] += a;
+                        }*/
+                        size_t pan[] = {0, 1, 1, 0};
+                        Sample s = mod.samples[state.cstate[i].livesample - 1];
+                        double a = s.data[(uint64_t)state.cstate[i].samplepoint];
+                        assert((uint64_t)state.cstate[i].samplepoint < s.length);
+                        ret.audio[pan[i % 4]][sample] += ((a*256.0)*(state.cstate[i].livevolume/64.0))/mod.patterns[mod.orders[order]].rows[0].nchannels*2;
+                        state.cstate[i].samplepoint += (7093789.2/(state.cstate[i].liveperiod*2))/44100.0;
+                        //state.cstate[i].samplepoint += 44100.0/(7093789.2 / state.cstate[i].liveperiod*2);
+                        //state.cstate[i].samplepoint += 0.03125;
                     }
                 }
             }
         }
+        if(!tick)
+            std::cout << std::endl;
         return ret;
     }
 
@@ -478,7 +561,7 @@ private:
             mod.samples[i].data = new int8_t[mod.samples[i].length];
             moduledata.read((char*)mod.samples[i].data, mod.samples[i].length);
             if(!moduledata.good()) {
-               return 0;
+                return 0;
             }
         }
         return 1;
@@ -520,6 +603,7 @@ private:
             mod.samples[i].length |= (unsigned long)moduledata.get() << 8;
             mod.samples[i].length |= moduledata.get();
             mod.samples[i].length *= 2;
+            std::cout << mod.samples[i].length << std::endl;
             mod.samples[i].finetune = moduledata.get();
             mod.samples[i].volume = moduledata.get();
             mod.samples[i].loopstart |= (unsigned long)moduledata.get() << 8;
@@ -553,11 +637,11 @@ private:
         for(uint64_t i = 0; i < 128; i++){
             if(i < mod.norders) {
                 mod.orders[i] = moduledata.get();
-                mod.npatterns = mod.npatterns > (mod.orders[i] + 1) ? (mod.npatterns) : (mod.orders[i] + 1);
+                mod.npatterns = mod.npatterns > (uint64_t)(mod.orders[i] + 1) ? (mod.npatterns) : (mod.orders[i] + 1);
 
             } else {
                 uint8_t item = moduledata.get();
-                mod.npatterns = mod.npatterns > (item + 1) ? (mod.npatterns) : (item + 1);
+                mod.npatterns = mod.npatterns > (uint64_t)(item + 1) ? (mod.npatterns) : (item + 1);
             }
         }
         if(!moduledata.good()) {
@@ -587,25 +671,25 @@ private:
         nchannels = tag[sampletag].nchannels;
         mod.patterns = new Pattern[mod.npatterns];
         for(uint8_t i = 0; i < mod.npatterns; i++) {
-           mod.patterns[i].nrows = 64;
-           mod.patterns[i].rows = new Row[64];
-           for(uint64_t row = 0; row < mod.patterns[i].nrows; row++){
-               mod.patterns[i].rows[row].nchannels = nchannels;
-               mod.patterns[i].rows[row].notes = new Note[nchannels];
-               for(uint64_t channel = 0; channel < nchannels; channel++) {
-                   uint8_t note[4];
-                   note[0] = (unsigned long)moduledata.get();
-                   note[1] = (unsigned long)moduledata.get();
-                   note[2] = (unsigned long)moduledata.get();
-                   note[3] = (unsigned long)moduledata.get();
-                   Note stnote;
-                   stnote.period = ((note[0] & 0x0F) << 8) | (note[1]);
-                   stnote.effect = note[2] & 0x0F;
-                   stnote.argument = note[3];
-                   stnote.sample = (note[0] & 0xF0) | (note[2] & 0xF0) >> 4;
-                   mod.patterns[i].rows[row].notes[channel] = stnote;
-               }
-           }
+            mod.patterns[i].nrows = 64;
+            mod.patterns[i].rows = new Row[64];
+            for(uint64_t row = 0; row < mod.patterns[i].nrows; row++){
+                mod.patterns[i].rows[row].nchannels = nchannels;
+                mod.patterns[i].rows[row].notes = new Note[nchannels];
+                for(uint64_t channel = 0; channel < nchannels; channel++) {
+                    uint8_t note[4];
+                    note[0] = (unsigned long)moduledata.get();
+                    note[1] = (unsigned long)moduledata.get();
+                    note[2] = (unsigned long)moduledata.get();
+                    note[3] = (unsigned long)moduledata.get();
+                    Note stnote;
+                    stnote.period = ((note[0] & 0x0F) << 8) | (note[1]);
+                    stnote.effect = note[2] & 0x0F;
+                    stnote.argument = note[3];
+                    stnote.sample = (note[0] & 0xF0) | (note[2] & 0xF0) >> 4;
+                    mod.patterns[i].rows[row].notes[channel] = stnote;
+                }
+            }
         }
         if(!moduledata.good()) {
             return 0;
